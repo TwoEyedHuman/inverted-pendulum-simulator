@@ -1,6 +1,14 @@
+import asyncio
+import json
 import math
+
+import pytest
+import uvicorn
+import websockets
+
 import app.simulation as sim
 from app.simulation import SimulationState, step, is_failed, reset
+from app.main import app as fastapi_app, _manager
 
 
 def _total_energy(state: SimulationState) -> float:
@@ -58,3 +66,28 @@ def test_reset_fails_within_expected_time():
     # Linearised estimate: theta(t) = 0.05*cosh(sqrt(g/l)*t), fails at |theta|=0.5
     # => t ≈ arccosh(10) / sqrt(19.62) ≈ 0.68s; friction slows it slightly
     assert 0.4 < state.time < 2.0, f"Failure time {state.time:.3f}s outside expected range"
+
+
+@pytest.mark.anyio
+async def test_ws_message_schema(free_tcp_port):
+    _manager.reset()
+
+    config = uvicorn.Config(fastapi_app, host="127.0.0.1", port=free_tcp_port, log_level="error")
+    server = uvicorn.Server(config)
+
+    server_task = asyncio.create_task(server.serve())
+    while not server.started:
+        await asyncio.sleep(0.05)
+
+    try:
+        async with websockets.connect(f"ws://127.0.0.1:{free_tcp_port}/ws") as ws:
+            data = json.loads(await ws.recv())
+            expected_keys = {"x", "x_dot", "theta", "theta_dot", "force", "time", "failed", "controller"}
+            assert set(data.keys()) == expected_keys
+            assert isinstance(data["x"], float)
+            assert isinstance(data["theta"], float)
+            assert isinstance(data["failed"], bool)
+            assert data["controller"] in ("pid", "lqr")
+    finally:
+        server.should_exit = True
+        await server_task
